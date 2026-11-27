@@ -3,24 +3,64 @@ set -euo pipefail
 umask 077
 
 VPN_USER=amnezia
-SSH_PORT=3568
+DEFAULT_SSH_PORT=2222
 IGNORE_IPS="127.0.0.1/8 ::1 92.38.32.98/32 158.160.0.0/16 94.249.187.243/32"
 BANTIME=24h
 FINDTIME=1h
 MAXRETRY=3
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-KEY="$SCRIPT_DIR/amnezia.key"
+KEY=/root/amnezia.key
 SSH_CONFIG=/etc/ssh/sshd_config.d/00-amnezia.conf
+FAIL2BAN_CONFIG=/etc/fail2ban/jail.local
 
 say() { printf '\033[1;36m%s\033[0m\n' "$*"; }
 info() { printf '\n'; say "$*"; }
 fail() { printf '\n\033[1;31m%s\033[0m\n' "$*" >&2; exit 1; }
 ask() { read -r -p $'\n\033[1;33m'"$1"$'\033[0m' answer; }
 
+ssh_config_ok() {
+    local cfg
+    cfg=$(sshd -T) || return 1
+    [[ $(grep '^port ' <<< "$cfg") == "port $SSH_PORT" ]] &&
+        grep -qx 'passwordauthentication no' <<< "$cfg" &&
+        grep -qx 'kbdinteractiveauthentication no' <<< "$cfg"
+}
+
+install_fail2ban() {
+    apt install -y fail2ban
+    systemctl enable fail2ban
+
+    if [[ -f $FAIL2BAN_CONFIG ]]; then
+        cp "$FAIL2BAN_CONFIG" "$FAIL2BAN_CONFIG.bak.$(date +%F_%H-%M-%S)"
+    fi
+
+    cat > "$FAIL2BAN_CONFIG" <<EOF
+[DEFAULT]
+ignoreip = $IGNORE_IPS
+bantime = $BANTIME
+findtime = $FINDTIME
+maxretry = $MAXRETRY
+
+[sshd]
+enabled = true
+port = $SSH_PORT
+backend = systemd
+EOF
+
+    fail2ban-client -t
+    systemctl restart fail2ban
+    for _ in {1..30}; do
+        fail2ban-client status sshd >/dev/null 2>&1 && break
+        sleep 1
+    done
+    fail2ban-client status sshd
+}
+
+main() {
+SSH_PORT=${1:-$DEFAULT_SSH_PORT}
+
 [[ $EUID -eq 0 ]] || fail 'Run as root'
 [[ $SSH_PORT =~ ^[0-9]+$ ]] && (( 10#$SSH_PORT >= 1 && 10#$SSH_PORT <= 65535 )) || fail 'Invalid SSH port'
-[[ -f "$SCRIPT_DIR/install_fail2ban.sh" ]] || fail 'install_fail2ban.sh not found'
 
 systemctl stop apt-daily.timer apt-daily-upgrade.timer
 
@@ -68,16 +108,8 @@ if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
     ufw allow "$SSH_PORT/tcp"
 fi
 
-ssh_config_ok() {
-    local cfg
-    cfg=$(sshd -T) || return 1
-    [[ $(grep '^port ' <<< "$cfg") == "port $SSH_PORT" ]] &&
-        grep -qx 'passwordauthentication no' <<< "$cfg" &&
-        grep -qx 'kbdinteractiveauthentication no' <<< "$cfg"
-}
-
 if [[ -e $SSH_CONFIG ]]; then
-    ssh_config_ok || fail 'Existing SSH configuration does not match the setup.'
+    ssh_config_ok || fail "Existing SSH configuration does not match the setup (configured port: $current_port)."
     info 'SSH configuration already applied.'
 else
 backup_dir=$(mktemp -d)
@@ -122,7 +154,7 @@ fi
 rm -rf "$backup_dir"
 fi
 
-bash "$SCRIPT_DIR/install_fail2ban.sh" "$SSH_PORT" "$IGNORE_IPS" "$BANTIME" "$FINDTIME" "$MAXRETRY"
+install_fail2ban
 
 info "Connect in another terminal as $VPN_USER on port $SSH_PORT using the copied key.
 Keep this session open until the new connection works."
@@ -133,3 +165,7 @@ if [[ $answer == yes ]]; then
 else
     info "Setup completed; remove $KEY and $KEY.pub after verifying the connection."
 fi
+}
+
+# Вызов стоит последней строкой: при оборванной загрузке через curl не выполнится ни одна команда.
+main "$@"
